@@ -9,9 +9,8 @@ const int MOTOR_FWD_PIN = 22;
 const int MOTOR_BWD_PIN = 23;
 const int SERVO_PIN     = 14;
 
-const int STEER_MAX      = 60;
-const int STEER_RATE_PER_PERCENT = 4;
-const int DEFAULT_STEER_PERCENT  = 50;
+const int STEER_MAX      = 60; // Maximum degrees left/right from home
+const int DEFAULT_STEER_PERCENT = 50;
 const int DEFAULT_HOME  = 90;
 const int SERVO_MIN_US  = 500;
 const int SERVO_MAX_US  = 2500;
@@ -25,15 +24,12 @@ int homeAngle = DEFAULT_HOME;
 int motorDir = 0;
 unsigned long lastCmd = 0;
 
-int steerDir = 0;
-float steerOffset = 0;
-float steerRate = DEFAULT_STEER_PERCENT * STEER_RATE_PER_PERCENT;
+int steerLimit = (DEFAULT_STEER_PERCENT * STEER_MAX) / 100;
+bool isSteering = false;
 unsigned long lastSteerCmd = 0;
-unsigned long lastSteerStep = 0;
 
 void goHome() {
-  steerDir = 0;
-  steerOffset = 0;
+  isSteering = false;
   servoWrite(homeAngle);
 }
 
@@ -69,7 +65,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
     <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
     <title>Sphere Bot Pro</title>
     <style>
-        /* --- THEME VARIABLES (DAY / NIGHT) --- */
         :root {
             --panel-bg: rgba(10, 12, 20, 0.4);
             --text-main: #ffffff;
@@ -105,12 +100,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
             transition: color 0.5s ease; background: #000;
         }
 
-        /* --- FULLSCREEN 3D CANVAS --- */
-        #bg-canvas {
-            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: -1;
-        }
+        #bg-canvas { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: -1; }
 
-        /* --- GLASSMORPHISM PANELS --- */
         .glass-panel {
             width: 100%; display: flex; justify-content: space-between; align-items: center;
             background: var(--panel-bg); padding: 10px 25px; border-radius: 16px;
@@ -122,13 +113,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         .top-bar { margin-bottom: 12px; }
         .status-item { display: flex; align-items: center; gap: 8px; font-weight: 800; letter-spacing: 1px; font-size: 14px; text-shadow: 0 0 10px currentColor; }
         
-        .settings-panel { margin-bottom: 15px; padding: 12px 20px; gap: 15px; }
-        .sliders-col { display: flex; flex-direction: column; gap: 10px; flex: 1; }
-        .slider-row { display: flex; align-items: center; gap: 10px; }
-        .slider-row span { font-size: 11px; font-weight: 800; color: var(--accent-cyan); width: 80px; letter-spacing: 1px; }
-        .slider-row input[type=range] { flex: 1; accent-color: var(--accent-cyan); height: 12px; cursor: pointer; }
-        .slider-row .val { width: 40px; text-align: right; font-variant-numeric: tabular-nums; font-weight: bold; }
-        
+        .top-actions { display: flex; gap: 8px; }
+
         .btn-icon {
             background: rgba(0, 0, 0, 0.1); border: 1px solid var(--accent-cyan);
             color: var(--accent-cyan); border-radius: 12px; height: 44px; width: 44px;
@@ -140,10 +126,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         /* --- CONTROLLER LAYOUT --- */
         .controller-layout { 
             display: flex; flex-direction: row; align-items: center; justify-content: space-around; 
-            width: 100%; flex: 1; padding-bottom: 10px; z-index: 5;
+            width: 100%; flex: 1; padding-bottom: 10px; z-index: 5; min-height: 0;
         }
         
-        /* Joysticks */
         .joystick-bg {
             background: var(--joystick-bg); border: 2px solid var(--border-glow);
             box-shadow: inset 0 4px 15px rgba(0,0,0,0.3); cursor: pointer;
@@ -172,7 +157,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         .slider-fill-h { height: 100%; left: 50%; width: 0%; border-radius: 25px; }
         .knob-horizontal { background: linear-gradient(135deg, #ff007f 0%, #ff2a5f 100%); }
 
-        /* Dashboard */
         .wheel-container { position: relative; width: 170px; height: 170px; display: flex; justify-content: center; align-items: center; margin: 0 10px; }
         .wheel-outer-ring { position: absolute; width: 100%; height: 100%; border-radius: 50%; border: 2px dashed var(--border-glow); animation: rotate-cw 20s linear infinite; }
         .speed-wheel {
@@ -192,9 +176,32 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         .val-negative { color: var(--accent-red); }
         .steering-display { font-size: 15px; color: var(--accent-cyan); margin-top: 5px; font-weight: 800; min-height: 20px;}
 
-        /* Modal */
-        #panel { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 100; backdrop-filter: blur(8px); }
-        #panel.show { display: flex; }
+        /* --- RESPONSIVE FIXES FOR LANDSCAPE --- */
+        @media (max-height: 600px) {
+            body { padding: 6px 10px; }
+            .glass-panel { padding: 6px 15px; }
+            .top-bar { margin-bottom: 6px; }
+            .btn-icon { height: 38px; width: 38px; font-size: 18px; }
+            
+            .controller-layout { padding-bottom: 4px; }
+            .pad-wrapper-left { height: 140px; width: 50px; }
+            .pad-wrapper-right { width: 150px; height: 50px; }
+            .joystick-knob { width: 44px; height: 44px; }
+            .joy-label { font-size: 16px; }
+            
+            .pad-wrapper-left .joy-label.top { top: -22px; }
+            .pad-wrapper-left .joy-label.bottom { bottom: -22px; }
+            .pad-wrapper-right .joy-label.left { left: -22px; }
+            .pad-wrapper-right .joy-label.right { right: -22px; }
+            
+            .wheel-container { width: 120px; height: 120px; margin: 0 5px; }
+            .velocity-display { font-size: 34px; }
+            .steering-display { font-size: 11px; margin-top: 2px; }
+        }
+
+        /* Modal Panels */
+        #panel, #settings-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 100; backdrop-filter: blur(8px); }
+        #panel.show, #settings-modal.show { display: flex; }
         #card { background: var(--panel-bg); border: 1px solid var(--border-glow); border-radius: 20px; padding: 25px; width: min(90%, 350px); text-align: center; box-shadow: 0 20px 50px rgba(0,0,0,0.5); backdrop-filter: blur(30px); }
         #card h3 { margin: 0 0 10px; color: var(--text-main); font-size: 22px; }
         #card p { margin: 0 0 20px; font-size: 14px; color: var(--text-muted); }
@@ -202,34 +209,27 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         .row { display: flex; gap: 15px; margin-bottom: 15px; }
         .row button { flex: 1; height: 50px; border: none; border-radius: 12px; font-size: 20px; font-weight: 700; cursor: pointer; transition: 0.2s; }
         .btn-light { background: rgba(128,128,128,0.2); color: var(--text-main); }
-        #save { background: linear-gradient(135deg, #2af598, #009efd); color: #fff; text-shadow: 0 2px 4px rgba(0,0,0,0.3); box-shadow: 0 0 20px rgba(42,245,152,0.4); }
+        #save, #close-settings { background: linear-gradient(135deg, #2af598, #009efd); color: #fff; text-shadow: 0 2px 4px rgba(0,0,0,0.3); box-shadow: 0 0 20px rgba(42,245,152,0.4); }
         #cancel { background: rgba(255, 31, 90, 0.1); border: 1px solid var(--accent-red); color: var(--accent-red); font-size: 16px; }
         .row button:active { transform: scale(0.95); }
+
+        /* Sliders inside settings modal */
+        .sliders-col { display: flex; flex-direction: column; gap: 15px; width: 100%; margin: 15px 0 25px 0; }
+        .slider-row { display: flex; align-items: center; gap: 10px; }
+        .slider-row span { font-size: 12px; font-weight: 800; color: var(--accent-cyan); width: 90px; text-align: left; letter-spacing: 1px; }
+        .slider-row input[type=range] { flex: 1; accent-color: var(--accent-cyan); height: 12px; cursor: pointer; }
+        .slider-row .val { width: 45px; text-align: right; font-variant-numeric: tabular-nums; font-weight: bold; }
     </style>
 </head>
 <body>
-    <!-- INTERACTIVE 3D BACKGROUND CANVAS -->
     <canvas id="bg-canvas"></canvas>
 
+    <!-- Top Navigation Bar -->
     <div class="top-bar glass-panel">
         <div class="status-item" id="status" style="color: var(--accent-green);">● ONLINE</div>
-        <div class="status-item" style="color: var(--accent-cyan);">RSSI: MAX</div>
-    </div>
-
-    <div class="settings-panel glass-panel">
-        <div class="sliders-col">
-            <div class="slider-row">
-                <span>DRIVE MAX</span>
-                <input id="spd" type="range" min="0" max="100" value="50">
-                <span class="val" id="spdv">50%</span>
-            </div>
-            <div class="slider-row">
-                <span>STEER MAX</span>
-                <input id="sspd" type="range" min="1" max="100" value="50">
-                <span class="val" id="sspdv">50%</span>
-            </div>
-        </div>
-        <div style="display:flex; flex-direction:column; gap:8px;">
+        <div class="top-actions">
+            <!-- 3-Dot / Settings Button -->
+            <button class="btn-icon" id="settings-btn" aria-label="Speed Settings">&#8942;</button>
             <button class="btn-icon" id="theme-toggle" aria-label="Toggle Theme">🌙</button>
             <button class="btn-icon" id="gear" aria-label="Servo home">&#9881;</button>
         </div>
@@ -267,7 +267,28 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- Modal -->
+    <!-- Speed Controls Pop-up Modal (Opened via 3-Dot Button) -->
+    <div id="settings-modal">
+        <div id="card">
+            <h3>Speed Limits</h3>
+            <p>Adjust max drive and steering bounds</p>
+            <div class="sliders-col">
+                <div class="slider-row">
+                    <span>DRIVE MAX</span>
+                    <input id="spd" type="range" min="0" max="100" value="50">
+                    <span class="val" id="spdv">50%</span>
+                </div>
+                <div class="slider-row">
+                    <span>STEER MAX</span>
+                    <input id="sspd" type="range" min="1" max="100" value="50">
+                    <span class="val" id="sspdv">50%</span>
+                </div>
+            </div>
+            <div class="row"><button id="close-settings">Done</button></div>
+        </div>
+    </div>
+
+    <!-- Servo Trim Modal -->
     <div id="panel">
         <div id="card">
             <h3>Servo Trim</h3>
@@ -281,25 +302,28 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
     <script>
         const $ = id => document.getElementById(id);
         
-        let driveDir = 0; let driveSpeed = 0; let steerDir = 0;
+        let driveDir = 0; let driveSpeed = 0; 
+        let steerVal = 0;
         let driveTimer = null; let steerTimer = null;
 
-        // --- THEME LOGIC ---
+        // --- THEME & POPUP MODALS LOGIC ---
         let isLightMode = false;
         $('theme-toggle').onclick = () => {
             isLightMode = !isLightMode;
             document.documentElement.setAttribute('data-theme', isLightMode ? 'light' : 'dark');
             $('theme-toggle').textContent = isLightMode ? '☀️' : '🌙';
         };
+
+        // Open/Close 3-Dot Speed Settings Modal
+        $('settings-btn').onclick = () => $('settings-modal').classList.add('show');
+        $('close-settings').onclick = () => $('settings-modal').classList.remove('show');
         
-        // --- API Handler ---
         function api(u){
             return fetch(u, {cache:'no-store'})
                 .then(r => { $('status').style.color = 'var(--accent-green)'; $('status').textContent = '● ONLINE'; return r.text(); })
                 .catch(() => { $('status').style.color = 'var(--accent-red)'; $('status').textContent = '● OFFLINE'; return null; });
         }
 
-        // --- 3D INTERACTIVE PLEXUS CANVAS SYSTEM ---
         const canvas = $('bg-canvas');
         const ctx = canvas.getContext('2d');
         let cw, ch;
@@ -307,7 +331,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         window.addEventListener('resize', resize); resize();
 
         const particles = [];
-        const numParticles = 100; // Optimized for smooth mobile performance
+        const numParticles = 100;
         for(let i=0; i<numParticles; i++) {
             particles.push({
                 x: (Math.random() - 0.5) * 2000,
@@ -316,14 +340,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
             });
         }
 
-        // These variables react to the Joysticks!
-        let targetGridSpeed = 2; // Idle speed
+        let targetGridSpeed = 2;
         let currentGridSpeed = 2;
         let targetGridSteer = 0;
         let currentGridSteer = 0;
         let mouseX = 0, mouseY = 0;
 
-        // Camera tilt based on touch / mouse movement
         document.addEventListener('mousemove', e => {
             mouseX = (e.clientX - cw/2) * 0.4;
             mouseY = (e.clientY - ch/2) * 0.4;
@@ -334,11 +356,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         }, {passive: true});
 
         function render3D() {
-            // Background Fade (Trail effect)
             ctx.fillStyle = isLightMode ? 'rgba(238, 242, 246, 0.4)' : 'rgba(3, 4, 9, 0.4)';
             ctx.fillRect(0, 0, cw, ch);
 
-            // Smooth value interpolation
             currentGridSpeed += (targetGridSpeed - currentGridSpeed) * 0.1;
             currentGridSteer += (targetGridSteer - currentGridSteer) * 0.1;
 
@@ -346,15 +366,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
             const cy = ch/2 + mouseY;
             let projected = [];
 
-            // Move & Project 3D particles
             for(let i=0; i<numParticles; i++) {
                 let p = particles[i];
-                p.z -= currentGridSpeed; // Speed from Left Joystick
-                p.x -= currentGridSteer; // Steering from Right Joystick
+                p.z -= currentGridSpeed;
+                p.x -= currentGridSteer;
 
-                // Reset particle if it goes out of bounds
                 if(p.z <= 1) { p.z = 2000; p.x = (Math.random() - 0.5) * 2000; p.y = (Math.random() - 0.5) * 2000; }
-                if(p.z > 2000) { p.z = 1; } // Reversing
+                if(p.z > 2000) { p.z = 1; }
                 if(p.x < -1000) p.x += 2000;
                 if(p.x > 1000) p.x -= 2000;
 
@@ -367,21 +385,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
                 }
             }
 
-            // Draw Plexus Lines (Pro Robotics Look)
             ctx.lineWidth = 1;
             for(let i=0; i<projected.length; i++) {
                 let p1 = projected[i];
-                // Draw Node
                 let size = Math.max(0.5, (2000 - p1.z) / 400);
                 ctx.fillStyle = isLightMode ? '#0066ff' : '#00f2fe';
                 ctx.beginPath(); ctx.arc(p1.x, p1.y, size, 0, Math.PI*2); ctx.fill();
 
-                // Connect Lines
                 for(let j=i+1; j<projected.length; j++) {
                     let p2 = projected[j];
                     let dx = p1.x - p2.x; let dy = p1.y - p2.y;
                     let distSq = dx*dx + dy*dy;
-                    if(distSq < 15000) { // Connection distance
+                    if(distSq < 15000) {
                         let alpha = 1 - Math.sqrt(distSq)/122;
                         let zFade = Math.max(0, 1 - (p1.z + p2.z)/4000);
                         ctx.strokeStyle = isLightMode 
@@ -395,28 +410,28 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         }
         requestAnimationFrame(render3D);
 
-        // --- Settings Sliders ---
         $('spd').addEventListener('input', () => {
             $('spdv').textContent =$('spd').value + '%';
             if(driveDir !== 0) sendDrive(); 
         });
+        
         function sendSteerSpeed(){ api('/steerspeed?v='+$('sspd').value); }$('sspd').addEventListener('input', () => {
             $('sspdv').textContent =$('sspd').value + '%'; sendSteerSpeed();
         });
 
-        // --- Drive Logic (Left Joystick) ---
         function sendDrive() { api('/drive?d=' + driveDir + '&v=' + driveSpeed); }
+        function sendSteer() { api('/steer?v=' + (-steerVal)); }
+
         function updateDriveOutput(analogVal) {
             let maxDrive = parseInt($('spd').value);
             let rawSpeed = Math.abs(analogVal);
             
             if (rawSpeed < 10) { 
                 driveDir = 0; driveSpeed = 0;
-                targetGridSpeed = 2; // Idle 3D Speed
+                targetGridSpeed = 2; 
             } else {
                 driveDir = analogVal > 0 ? 1 : -1;
                 driveSpeed = Math.round((rawSpeed / 100) * maxDrive);
-                // 3D Canvas Warp Effect reacts to Drive Joystick!
                 targetGridSpeed = driveDir > 0 ? (2 + (rawSpeed * 0.2)) : (-2 - (rawSpeed * 0.2)); 
             }
             
@@ -431,24 +446,26 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
             }
         }
 
-        // --- Steer Logic (Right Joystick) ---
         function updateSteerOutput(analogVal) {
-            let newSteerDir = 0;
-            if (analogVal > 20) newSteerDir = 1; else if (analogVal < -20) newSteerDir = -1;
-            
-            // 3D Canvas Steer Effect reacts to Steering Joystick!
+            steerVal = Math.round(analogVal);
             targetGridSteer = analogVal * 0.25;
 
-            $('steering').textContent = newSteerDir > 0 ? 'RIGHT >>>' : (newSteerDir < 0 ? '<<< LEFT' : '');
-            if (steerDir !== newSteerDir) {
-                steerDir = newSteerDir;
-                clearInterval(steerTimer); steerTimer = null;
-                api('/steer?d=' + steerDir);
-                if(steerDir !== 0) steerTimer = setInterval(() => api('/steer?d=' + steerDir), 200);
+            $('steering').textContent = steerVal > 5 ? 'RIGHT >>>' : (steerVal < -5 ? '<<< LEFT' : '');
+            
+            if (Math.abs(steerVal) > 5) {
+                if (!steerTimer) {
+                    sendSteer();
+                    steerTimer = setInterval(sendSteer, 100); 
+                }
+            } else {
+                steerVal = 0;
+                if (steerTimer) {
+                    clearInterval(steerTimer); steerTimer = null;
+                    sendSteer(); 
+                }
             }
         }
 
-        // --- Hybrid Touch & Mouse Joystick Engine ---
         function makeJoystick(bgId, knobId, fillId, isVert, onUpdate) {
             const bg = $(bgId); const knob = $(knobId); const fill =$(fillId);
             let activeTouch = null; let isMouseDown = false;
@@ -488,7 +505,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
                 onUpdate(0);
             }
 
-            // TOUCH EVENTS
             bg.addEventListener('touchstart', e => {
                 e.preventDefault(); if (activeTouch !== null) return;
                 let t = e.changedTouches[0]; activeTouch = t.identifier;
@@ -506,7 +522,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
             }, {passive: false});
             bg.addEventListener('touchcancel', reset, {passive: false});
 
-            // MOUSE EVENTS
             bg.addEventListener('mousedown', e => {
                 e.preventDefault(); if (activeTouch !== null) return;
                 isMouseDown = true; bg.classList.add('active'); updatePos(e.clientX, e.clientY);
@@ -520,12 +535,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         makeJoystick('slider-v-bg', 'knob-v', 'fill-v', true, updateDriveOutput);
         makeJoystick('slider-h-bg', 'knob-h', 'fill-h', false, updateSteerOutput);
 
-        // --- Modals ---
         $('gear').onclick = async () => { const a = await api('/homeopen'); if(a !== null) {$('ang').textContent = a + '\u00b0'; $('panel').classList.add('show'); } };$('hm').onclick = async () => { const a = await api('/homestep?d=-1'); if(a!==null) $('ang').textContent = a + '\u00b0'; };$('hp').onclick = async () => { const a = await api('/homestep?d=1'); if(a!==null) $('ang').textContent = a + '\u00b0'; };
         $('save').onclick = async () => { await api('/homesave');$('panel').classList.remove('show'); };
         $('cancel').onclick = async () => { await api('/homecancel');$('panel').classList.remove('show'); };
 
-        document.addEventListener('visibilitychange', () => { if(document.hidden) { api('/drive?d=0&v=0'); api('/steer?d=0'); } });
+        document.addEventListener('visibilitychange', () => { 
+            if(document.hidden) { 
+                api('/drive?d=0&v=0');
+                steerVal = 0; sendSteer();
+                if(steerTimer) { clearInterval(steerTimer); steerTimer = null; }
+                if(driveTimer) { clearInterval(driveTimer); driveTimer = null; }
+            } 
+        });
         api('/ping'); sendSteerSpeed();
     </script>
 </body>
@@ -551,21 +572,22 @@ void handleDrive() {
 }
 
 void handleSteer() {
-  int d = server.arg("d").toInt();
-  if (d == 0) {
+  int v = constrain(server.arg("v").toInt(), -100, 100);
+  
+  if (v == 0) {
     goHome();
   } else {
-    int newDir = (d > 0) ? 1 : -1;
-    if (steerDir != newDir) lastSteerStep = millis();
-    steerDir = newDir;
+    isSteering = true;
     lastSteerCmd = millis();
+    int angleOffset = (v * steerLimit) / 100;
+    servoWrite(homeAngle + angleOffset);
   }
   sendText("ok");
 }
 
 void handleSteerSpeed() {
   int v = constrain(server.arg("v").toInt(), 1, 100);
-  steerRate = v * STEER_RATE_PER_PERCENT;
+  steerLimit = (v * STEER_MAX) / 100;
   sendText("ok");
 }
 
@@ -630,19 +652,11 @@ void loop() {
 
   unsigned long now = millis();
 
-  if (steerDir != 0 && now - lastSteerStep >= 10) {
-    float dt = (now - lastSteerStep) / 1000.0f;
-    lastSteerStep = now;
-    steerOffset += steerDir * steerRate * dt;
-    steerOffset = constrain(steerOffset, (float)-STEER_MAX, (float)STEER_MAX);
-    servoWrite(homeAngle + (int)roundf(steerOffset));
-  }
-
   if (motorDir != 0 && now - lastCmd > WATCHDOG_MS) {
     setMotor(0, 0);
   }
 
-  if (steerDir != 0 && now - lastSteerCmd > WATCHDOG_MS) {
+  if (isSteering && now - lastSteerCmd > WATCHDOG_MS) {
     goHome();
   }
 }
