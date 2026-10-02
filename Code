@@ -1,0 +1,648 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+
+const char* AP_SSID = "DUET_Helix_TF";
+const char* AP_PASS = "21345678";
+
+const int MOTOR_FWD_PIN = 22;
+const int MOTOR_BWD_PIN = 23;
+const int SERVO_PIN     = 14;
+
+const int STEER_MAX      = 60;
+const int STEER_RATE_PER_PERCENT = 4;
+const int DEFAULT_STEER_PERCENT  = 50;
+const int DEFAULT_HOME  = 90;
+const int SERVO_MIN_US  = 500;
+const int SERVO_MAX_US  = 2500;
+const unsigned long WATCHDOG_MS = 500;
+
+WebServer server(80);
+Preferences prefs;
+
+int savedHome = DEFAULT_HOME;
+int homeAngle = DEFAULT_HOME;
+int motorDir = 0;
+unsigned long lastCmd = 0;
+
+int steerDir = 0;
+float steerOffset = 0;
+float steerRate = DEFAULT_STEER_PERCENT * STEER_RATE_PER_PERCENT;
+unsigned long lastSteerCmd = 0;
+unsigned long lastSteerStep = 0;
+
+void goHome() {
+  steerDir = 0;
+  steerOffset = 0;
+  servoWrite(homeAngle);
+}
+
+void setMotor(int dir, int speed) {
+  speed = constrain(speed, 0, 100);
+  uint32_t duty = (uint32_t)speed * 255 / 100;
+  if (dir == 1 && speed > 0) {
+    ledcWrite(MOTOR_BWD_PIN, 0);
+    ledcWrite(MOTOR_FWD_PIN, duty);
+    motorDir = 1;
+  } else if (dir == -1 && speed > 0) {
+    ledcWrite(MOTOR_FWD_PIN, 0);
+    ledcWrite(MOTOR_BWD_PIN, duty);
+    motorDir = -1;
+  } else {
+    ledcWrite(MOTOR_FWD_PIN, 0);
+    ledcWrite(MOTOR_BWD_PIN, 0);
+    motorDir = 0;
+  }
+}
+
+void servoWrite(int angle) {
+  angle = constrain(angle, 0, 180);
+  float us = SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (angle / 180.0f);
+  uint32_t duty = (uint32_t)(us * 65535.0f / 20000.0f);
+  ledcWrite(SERVO_PIN, duty);
+}
+
+const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+    <title>Sphere Bot Pro</title>
+    <style>
+        /* --- THEME VARIABLES (DAY / NIGHT) --- */
+        :root {
+            --panel-bg: rgba(10, 12, 20, 0.4);
+            --text-main: #ffffff;
+            --text-muted: #8a9bb4;
+            --accent-cyan: #00f2fe;
+            --accent-green: #00ffaa;
+            --accent-red: #ff1f5a;
+            --border-glow: rgba(0, 242, 254, 0.25);
+            --shadow-glow: rgba(0, 242, 254, 0.15);
+            --joystick-bg: rgba(5, 7, 15, 0.6);
+            --wheel-bg: radial-gradient(circle, rgba(5,6,11,0.8) 40%, rgba(16,20,36,0.8) 75%, rgba(1,2,4,0.8) 100%);
+        }
+
+        [data-theme="light"] {
+            --panel-bg: rgba(255, 255, 255, 0.5);
+            --text-main: #1a2332;
+            --text-muted: #5a6b82;
+            --accent-cyan: #0066ff;
+            --accent-green: #00aa55;
+            --accent-red: #d90036;
+            --border-glow: rgba(0, 102, 255, 0.2);
+            --shadow-glow: rgba(0, 102, 255, 0.1);
+            --joystick-bg: rgba(230, 235, 240, 0.7);
+            --wheel-bg: radial-gradient(circle, rgba(255,255,255,0.8) 40%, rgba(238,242,246,0.8) 75%, rgba(213,220,230,0.8) 100%);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; touch-action: none; -webkit-tap-highlight-color: transparent; }
+        
+        body {
+            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            color: var(--text-main); height: 100vh; width: 100vw;
+            display: flex; flex-direction: column; align-items: center; padding: 12px 15px; overflow: hidden;
+            transition: color 0.5s ease; background: #000;
+        }
+
+        /* --- FULLSCREEN 3D CANVAS --- */
+        #bg-canvas {
+            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: -1;
+        }
+
+        /* --- GLASSMORPHISM PANELS --- */
+        .glass-panel {
+            width: 100%; display: flex; justify-content: space-between; align-items: center;
+            background: var(--panel-bg); padding: 10px 25px; border-radius: 16px;
+            backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--border-glow); box-shadow: 0 8px 32px var(--shadow-glow);
+            transition: all 0.5s ease;
+        }
+        
+        .top-bar { margin-bottom: 12px; }
+        .status-item { display: flex; align-items: center; gap: 8px; font-weight: 800; letter-spacing: 1px; font-size: 14px; text-shadow: 0 0 10px currentColor; }
+        
+        .settings-panel { margin-bottom: 15px; padding: 12px 20px; gap: 15px; }
+        .sliders-col { display: flex; flex-direction: column; gap: 10px; flex: 1; }
+        .slider-row { display: flex; align-items: center; gap: 10px; }
+        .slider-row span { font-size: 11px; font-weight: 800; color: var(--accent-cyan); width: 80px; letter-spacing: 1px; }
+        .slider-row input[type=range] { flex: 1; accent-color: var(--accent-cyan); height: 12px; cursor: pointer; }
+        .slider-row .val { width: 40px; text-align: right; font-variant-numeric: tabular-nums; font-weight: bold; }
+        
+        .btn-icon {
+            background: rgba(0, 0, 0, 0.1); border: 1px solid var(--accent-cyan);
+            color: var(--accent-cyan); border-radius: 12px; height: 44px; width: 44px;
+            font-size: 20px; display: flex; align-items: center; justify-content: center;
+            cursor: pointer; transition: all 0.2s; box-shadow: 0 0 15px var(--shadow-glow);
+        }
+        .btn-icon:active { transform: scale(0.9); }
+
+        /* --- CONTROLLER LAYOUT --- */
+        .controller-layout { 
+            display: flex; flex-direction: row; align-items: center; justify-content: space-around; 
+            width: 100%; flex: 1; padding-bottom: 10px; z-index: 5;
+        }
+        
+        /* Joysticks */
+        .joystick-bg {
+            background: var(--joystick-bg); border: 2px solid var(--border-glow);
+            box-shadow: inset 0 4px 15px rgba(0,0,0,0.3); cursor: pointer;
+            backdrop-filter: blur(10px); transition: all 0.5s ease;
+        }
+        .joystick-fill { position: absolute; pointer-events: none; transition: height 0.1s, width 0.1s, bottom 0.1s, left 0.1s; }
+        .joystick-knob {
+            width: 62px; height: 62px; border-radius: 50%; position: absolute; pointer-events: none;
+            left: 50%; top: 50%; transform: translate(-50%, -50%); border: 3px solid #fff;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.4); z-index: 5; transition: filter 0.2s;
+        }
+        .joystick-bg.active .joystick-knob { filter: brightness(1.3); box-shadow: 0 0 25px currentColor; }
+        .joy-label { font-size: 22px; font-weight: 900; position: absolute; text-shadow: 0 0 15px currentColor; }
+
+        .pad-wrapper-left { position: relative; height: 210px; width: 70px; display: flex; justify-content: center; }
+        .pad-wrapper-left .joy-label.top { top: -35px; color: var(--accent-green); }
+        .pad-wrapper-left .joy-label.bottom { bottom: -35px; color: var(--accent-red); }
+        .slider-vertical-bg { width: 100%; height: 100%; border-radius: 35px; position: relative; }
+        .slider-fill-v { width: 100%; bottom: 50%; height: 0%; border-radius: 25px; }
+        .knob-vertical { background: linear-gradient(135deg, #2af598 0%, #009efd 100%); }
+
+        .pad-wrapper-right { position: relative; width: 200px; height: 70px; display: flex; align-items: center; }
+        .pad-wrapper-right .joy-label.left { left: -32px; color: var(--accent-cyan); }
+        .pad-wrapper-right .joy-label.right { right: -32px; color: var(--accent-cyan); }
+        .slider-horizontal-bg { width: 100%; height: 100%; border-radius: 35px; position: relative; }
+        .slider-fill-h { height: 100%; left: 50%; width: 0%; border-radius: 25px; }
+        .knob-horizontal { background: linear-gradient(135deg, #ff007f 0%, #ff2a5f 100%); }
+
+        /* Dashboard */
+        .wheel-container { position: relative; width: 170px; height: 170px; display: flex; justify-content: center; align-items: center; margin: 0 10px; }
+        .wheel-outer-ring { position: absolute; width: 100%; height: 100%; border-radius: 50%; border: 2px dashed var(--border-glow); animation: rotate-cw 20s linear infinite; }
+        .speed-wheel {
+            position: absolute; width: 88%; height: 88%; border-radius: 50%; background: var(--wheel-bg);
+            border: 4px solid var(--border-glow); box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+            display: flex; justify-content: center; align-items: center; overflow: hidden; transition: all 0.5s;
+            backdrop-filter: blur(10px);
+        }
+        .wheel-spokes { position: absolute; width: 100%; height: 100%; opacity: 0.15; background: linear-gradient(90deg, transparent 48%, var(--accent-cyan) 50%, transparent 52%), linear-gradient(0deg, transparent 48%, var(--accent-cyan) 50%, transparent 52%); }
+        .wheel-container.forward .speed-wheel { border-color: var(--accent-green); box-shadow: 0 0 40px rgba(0, 255, 170, 0.3); }
+        .wheel-container.backward .speed-wheel { border-color: var(--accent-red); box-shadow: 0 0 40px rgba(255, 31, 90, 0.3); }
+        @keyframes rotate-cw { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        
+        .wheel-content { position: relative; z-index: 2; display: flex; flex-direction: column; justify-content: center; align-items: center; pointer-events: none; }
+        .velocity-display { font-size: 54px; font-weight: 900; font-family: 'Courier New', monospace; line-height: 1; transition: color 0.2s; text-shadow: 0 0 15px currentColor; }
+        .val-positive { color: var(--accent-green); }
+        .val-negative { color: var(--accent-red); }
+        .steering-display { font-size: 15px; color: var(--accent-cyan); margin-top: 5px; font-weight: 800; min-height: 20px;}
+
+        /* Modal */
+        #panel { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 100; backdrop-filter: blur(8px); }
+        #panel.show { display: flex; }
+        #card { background: var(--panel-bg); border: 1px solid var(--border-glow); border-radius: 20px; padding: 25px; width: min(90%, 350px); text-align: center; box-shadow: 0 20px 50px rgba(0,0,0,0.5); backdrop-filter: blur(30px); }
+        #card h3 { margin: 0 0 10px; color: var(--text-main); font-size: 22px; }
+        #card p { margin: 0 0 20px; font-size: 14px; color: var(--text-muted); }
+        #ang { font-size: 48px; font-weight: 900; margin: 10px 0 20px; color: var(--accent-green); text-shadow: 0 0 15px currentColor;}
+        .row { display: flex; gap: 15px; margin-bottom: 15px; }
+        .row button { flex: 1; height: 50px; border: none; border-radius: 12px; font-size: 20px; font-weight: 700; cursor: pointer; transition: 0.2s; }
+        .btn-light { background: rgba(128,128,128,0.2); color: var(--text-main); }
+        #save { background: linear-gradient(135deg, #2af598, #009efd); color: #fff; text-shadow: 0 2px 4px rgba(0,0,0,0.3); box-shadow: 0 0 20px rgba(42,245,152,0.4); }
+        #cancel { background: rgba(255, 31, 90, 0.1); border: 1px solid var(--accent-red); color: var(--accent-red); font-size: 16px; }
+        .row button:active { transform: scale(0.95); }
+    </style>
+</head>
+<body>
+    <!-- INTERACTIVE 3D BACKGROUND CANVAS -->
+    <canvas id="bg-canvas"></canvas>
+
+    <div class="top-bar glass-panel">
+        <div class="status-item" id="status" style="color: var(--accent-green);">● ONLINE</div>
+        <div class="status-item" style="color: var(--accent-cyan);">RSSI: MAX</div>
+    </div>
+
+    <div class="settings-panel glass-panel">
+        <div class="sliders-col">
+            <div class="slider-row">
+                <span>DRIVE MAX</span>
+                <input id="spd" type="range" min="0" max="100" value="50">
+                <span class="val" id="spdv">50%</span>
+            </div>
+            <div class="slider-row">
+                <span>STEER MAX</span>
+                <input id="sspd" type="range" min="1" max="100" value="50">
+                <span class="val" id="sspdv">50%</span>
+            </div>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:8px;">
+            <button class="btn-icon" id="theme-toggle" aria-label="Toggle Theme">🌙</button>
+            <button class="btn-icon" id="gear" aria-label="Servo home">&#9881;</button>
+        </div>
+    </div>
+
+    <div class="controller-layout">
+        <!-- LEFT: Forward / Backward -->
+        <div class="pad-wrapper-left">
+            <div class="joy-label top">F</div>
+            <div class="slider-vertical-bg joystick-bg" id="slider-v-bg">
+                <div class="slider-fill-v joystick-fill" id="fill-v"></div>
+                <div class="knob-vertical joystick-knob" id="knob-v"></div>
+            </div>
+            <div class="joy-label bottom">B</div>
+        </div>
+
+        <!-- CENTER: Dashboard -->
+        <div class="wheel-container" id="wheel-container">
+            <div class="wheel-outer-ring"></div>
+            <div class="speed-wheel" id="animated-wheel"><div class="wheel-spokes"></div></div>
+            <div class="wheel-content">
+                <div class="velocity-display" id="velocity">0</div>
+                <div class="steering-display" id="steering"></div>
+            </div>
+        </div>
+
+        <!-- RIGHT: Left / Right -->
+        <div class="pad-wrapper-right">
+            <div class="joy-label left">L</div>
+            <div class="slider-horizontal-bg joystick-bg" id="slider-h-bg">
+                <div class="slider-fill-h joystick-fill" id="fill-h"></div>
+                <div class="knob-horizontal joystick-knob" id="knob-h"></div>
+            </div>
+            <div class="joy-label right">R</div>
+        </div>
+    </div>
+
+    <!-- Modal -->
+    <div id="panel">
+        <div id="card">
+            <h3>Servo Trim</h3>
+            <p>Fine-tune home position (1&deg; steps)</p>
+            <div id="ang">--</div>
+            <div class="row"><button id="hm" class="btn-light">&minus;</button><button id="hp" class="btn-light">+</button></div>
+            <div class="row"><button id="cancel">Cancel</button><button id="save">Save</button></div>
+        </div>
+    </div>
+
+    <script>
+        const $ = id => document.getElementById(id);
+        
+        let driveDir = 0; let driveSpeed = 0; let steerDir = 0;
+        let driveTimer = null; let steerTimer = null;
+
+        // --- THEME LOGIC ---
+        let isLightMode = false;
+        $('theme-toggle').onclick = () => {
+            isLightMode = !isLightMode;
+            document.documentElement.setAttribute('data-theme', isLightMode ? 'light' : 'dark');
+            $('theme-toggle').textContent = isLightMode ? '☀️' : '🌙';
+        };
+        
+        // --- API Handler ---
+        function api(u){
+            return fetch(u, {cache:'no-store'})
+                .then(r => { $('status').style.color = 'var(--accent-green)'; $('status').textContent = '● ONLINE'; return r.text(); })
+                .catch(() => { $('status').style.color = 'var(--accent-red)'; $('status').textContent = '● OFFLINE'; return null; });
+        }
+
+        // --- 3D INTERACTIVE PLEXUS CANVAS SYSTEM ---
+        const canvas = $('bg-canvas');
+        const ctx = canvas.getContext('2d');
+        let cw, ch;
+        function resize() { cw = canvas.width = window.innerWidth; ch = canvas.height = window.innerHeight; }
+        window.addEventListener('resize', resize); resize();
+
+        const particles = [];
+        const numParticles = 100; // Optimized for smooth mobile performance
+        for(let i=0; i<numParticles; i++) {
+            particles.push({
+                x: (Math.random() - 0.5) * 2000,
+                y: (Math.random() - 0.5) * 2000,
+                z: Math.random() * 2000
+            });
+        }
+
+        // These variables react to the Joysticks!
+        let targetGridSpeed = 2; // Idle speed
+        let currentGridSpeed = 2;
+        let targetGridSteer = 0;
+        let currentGridSteer = 0;
+        let mouseX = 0, mouseY = 0;
+
+        // Camera tilt based on touch / mouse movement
+        document.addEventListener('mousemove', e => {
+            mouseX = (e.clientX - cw/2) * 0.4;
+            mouseY = (e.clientY - ch/2) * 0.4;
+        });
+        document.addEventListener('touchmove', e => {
+            mouseX = (e.touches[0].clientX - cw/2) * 0.4;
+            mouseY = (e.touches[0].clientY - ch/2) * 0.4;
+        }, {passive: true});
+
+        function render3D() {
+            // Background Fade (Trail effect)
+            ctx.fillStyle = isLightMode ? 'rgba(238, 242, 246, 0.4)' : 'rgba(3, 4, 9, 0.4)';
+            ctx.fillRect(0, 0, cw, ch);
+
+            // Smooth value interpolation
+            currentGridSpeed += (targetGridSpeed - currentGridSpeed) * 0.1;
+            currentGridSteer += (targetGridSteer - currentGridSteer) * 0.1;
+
+            const cx = cw/2 + mouseX;
+            const cy = ch/2 + mouseY;
+            let projected = [];
+
+            // Move & Project 3D particles
+            for(let i=0; i<numParticles; i++) {
+                let p = particles[i];
+                p.z -= currentGridSpeed; // Speed from Left Joystick
+                p.x -= currentGridSteer; // Steering from Right Joystick
+
+                // Reset particle if it goes out of bounds
+                if(p.z <= 1) { p.z = 2000; p.x = (Math.random() - 0.5) * 2000; p.y = (Math.random() - 0.5) * 2000; }
+                if(p.z > 2000) { p.z = 1; } // Reversing
+                if(p.x < -1000) p.x += 2000;
+                if(p.x > 1000) p.x -= 2000;
+
+                let fov = 350;
+                let projX = (p.x / p.z) * fov + cx;
+                let projY = (p.y / p.z) * fov + cy;
+                
+                if (projX > -50 && projX < cw+50 && projY > -50 && projY < ch+50) {
+                    projected.push({x: projX, y: projY, z: p.z});
+                }
+            }
+
+            // Draw Plexus Lines (Pro Robotics Look)
+            ctx.lineWidth = 1;
+            for(let i=0; i<projected.length; i++) {
+                let p1 = projected[i];
+                // Draw Node
+                let size = Math.max(0.5, (2000 - p1.z) / 400);
+                ctx.fillStyle = isLightMode ? '#0066ff' : '#00f2fe';
+                ctx.beginPath(); ctx.arc(p1.x, p1.y, size, 0, Math.PI*2); ctx.fill();
+
+                // Connect Lines
+                for(let j=i+1; j<projected.length; j++) {
+                    let p2 = projected[j];
+                    let dx = p1.x - p2.x; let dy = p1.y - p2.y;
+                    let distSq = dx*dx + dy*dy;
+                    if(distSq < 15000) { // Connection distance
+                        let alpha = 1 - Math.sqrt(distSq)/122;
+                        let zFade = Math.max(0, 1 - (p1.z + p2.z)/4000);
+                        ctx.strokeStyle = isLightMode 
+                            ? `rgba(0, 102, 255, ${alpha * zFade})` 
+                            : `rgba(0, 242, 254, ${alpha * zFade})`;
+                        ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+                    }
+                }
+            }
+            requestAnimationFrame(render3D);
+        }
+        requestAnimationFrame(render3D);
+
+        // --- Settings Sliders ---
+        $('spd').addEventListener('input', () => {
+            $('spdv').textContent =$('spd').value + '%';
+            if(driveDir !== 0) sendDrive(); 
+        });
+        function sendSteerSpeed(){ api('/steerspeed?v='+$('sspd').value); }$('sspd').addEventListener('input', () => {
+            $('sspdv').textContent =$('sspd').value + '%'; sendSteerSpeed();
+        });
+
+        // --- Drive Logic (Left Joystick) ---
+        function sendDrive() { api('/drive?d=' + driveDir + '&v=' + driveSpeed); }
+        function updateDriveOutput(analogVal) {
+            let maxDrive = parseInt($('spd').value);
+            let rawSpeed = Math.abs(analogVal);
+            
+            if (rawSpeed < 10) { 
+                driveDir = 0; driveSpeed = 0;
+                targetGridSpeed = 2; // Idle 3D Speed
+            } else {
+                driveDir = analogVal > 0 ? 1 : -1;
+                driveSpeed = Math.round((rawSpeed / 100) * maxDrive);
+                // 3D Canvas Warp Effect reacts to Drive Joystick!
+                targetGridSpeed = driveDir > 0 ? (2 + (rawSpeed * 0.2)) : (-2 - (rawSpeed * 0.2)); 
+            }
+            
+            $('velocity').textContent = driveSpeed;
+            $('velocity').className = 'velocity-display ' + (driveDir > 0 ? 'val-positive' : (driveDir < 0 ? 'val-negative' : ''));$('wheel-container').className = 'wheel-container ' + (driveDir > 0 ? 'forward' : (driveDir < 0 ? 'backward' : ''));
+            
+            if (driveDir !== 0) {
+                sendDrive();
+                if(!driveTimer) driveTimer = setInterval(sendDrive, 200);
+            } else {
+                api('/drive?d=0&v=0'); clearInterval(driveTimer); driveTimer = null;
+            }
+        }
+
+        // --- Steer Logic (Right Joystick) ---
+        function updateSteerOutput(analogVal) {
+            let newSteerDir = 0;
+            if (analogVal > 20) newSteerDir = 1; else if (analogVal < -20) newSteerDir = -1;
+            
+            // 3D Canvas Steer Effect reacts to Steering Joystick!
+            targetGridSteer = analogVal * 0.25;
+
+            $('steering').textContent = newSteerDir > 0 ? 'RIGHT >>>' : (newSteerDir < 0 ? '<<< LEFT' : '');
+            if (steerDir !== newSteerDir) {
+                steerDir = newSteerDir;
+                clearInterval(steerTimer); steerTimer = null;
+                api('/steer?d=' + steerDir);
+                if(steerDir !== 0) steerTimer = setInterval(() => api('/steer?d=' + steerDir), 200);
+            }
+        }
+
+        // --- Hybrid Touch & Mouse Joystick Engine ---
+        function makeJoystick(bgId, knobId, fillId, isVert, onUpdate) {
+            const bg = $(bgId); const knob = $(knobId); const fill =$(fillId);
+            let activeTouch = null; let isMouseDown = false;
+
+            function updatePos(clientX, clientY) {
+                let rect = bg.getBoundingClientRect(); let analogVal = 0;
+                if (isVert) {
+                    let y = clientY - rect.top; y = Math.max(0, Math.min(y, rect.height));
+                    let percent = (y / rect.height) * 100; knob.style.top = percent + '%';
+                    analogVal = ((50 - percent) / 50) * 100;
+                    if(analogVal > 0) {
+                        fill.style.bottom = '50%'; fill.style.top = 'auto'; fill.style.height = (analogVal/2) + '%';
+                        fill.style.background = 'linear-gradient(to top, transparent, var(--accent-green))';
+                    } else {
+                        fill.style.top = '50%'; fill.style.bottom = 'auto'; fill.style.height = (Math.abs(analogVal)/2) + '%';
+                        fill.style.background = 'linear-gradient(to bottom, transparent, var(--accent-red))';
+                    }
+                } else {
+                    let x = clientX - rect.left; x = Math.max(0, Math.min(x, rect.width));
+                    let percent = (x / rect.width) * 100; knob.style.left = percent + '%';
+                    analogVal = ((percent - 50) / 50) * 100;
+                    if(analogVal > 0) {
+                        fill.style.left = '50%'; fill.style.right = 'auto'; fill.style.width = (analogVal/2) + '%';
+                        fill.style.background = 'linear-gradient(to right, transparent, var(--accent-cyan))';
+                    } else {
+                        fill.style.right = '50%'; fill.style.left = 'auto'; fill.style.width = (Math.abs(analogVal)/2) + '%';
+                        fill.style.background = 'linear-gradient(to left, transparent, var(--accent-cyan))';
+                    }
+                }
+                onUpdate(analogVal);
+            }
+
+            function reset() {
+                activeTouch = null; isMouseDown = false; bg.classList.remove('active');
+                if (isVert) knob.style.top = '50%'; else knob.style.left = '50%';
+                if (isVert) fill.style.height = '0%'; else fill.style.width = '0%';
+                onUpdate(0);
+            }
+
+            // TOUCH EVENTS
+            bg.addEventListener('touchstart', e => {
+                e.preventDefault(); if (activeTouch !== null) return;
+                let t = e.changedTouches[0]; activeTouch = t.identifier;
+                bg.classList.add('active'); updatePos(t.clientX, t.clientY);
+            }, {passive: false});
+            bg.addEventListener('touchmove', e => {
+                e.preventDefault();
+                for(let i=0; i<e.changedTouches.length; i++) {
+                    if (e.changedTouches[i].identifier === activeTouch) updatePos(e.changedTouches[i].clientX, e.changedTouches[i].clientY);
+                }
+            }, {passive: false});
+            bg.addEventListener('touchend', e => {
+                e.preventDefault();
+                for(let i=0; i<e.changedTouches.length; i++) { if (e.changedTouches[i].identifier === activeTouch) reset(); }
+            }, {passive: false});
+            bg.addEventListener('touchcancel', reset, {passive: false});
+
+            // MOUSE EVENTS
+            bg.addEventListener('mousedown', e => {
+                e.preventDefault(); if (activeTouch !== null) return;
+                isMouseDown = true; bg.classList.add('active'); updatePos(e.clientX, e.clientY);
+            });
+            document.addEventListener('mousemove', e => {
+                if (isMouseDown) { e.preventDefault(); updatePos(e.clientX, e.clientY); }
+            }, {passive: false});
+            document.addEventListener('mouseup', () => { if (isMouseDown) reset(); });
+        }
+
+        makeJoystick('slider-v-bg', 'knob-v', 'fill-v', true, updateDriveOutput);
+        makeJoystick('slider-h-bg', 'knob-h', 'fill-h', false, updateSteerOutput);
+
+        // --- Modals ---
+        $('gear').onclick = async () => { const a = await api('/homeopen'); if(a !== null) {$('ang').textContent = a + '\u00b0'; $('panel').classList.add('show'); } };$('hm').onclick = async () => { const a = await api('/homestep?d=-1'); if(a!==null) $('ang').textContent = a + '\u00b0'; };$('hp').onclick = async () => { const a = await api('/homestep?d=1'); if(a!==null) $('ang').textContent = a + '\u00b0'; };
+        $('save').onclick = async () => { await api('/homesave');$('panel').classList.remove('show'); };
+        $('cancel').onclick = async () => { await api('/homecancel');$('panel').classList.remove('show'); };
+
+        document.addEventListener('visibilitychange', () => { if(document.hidden) { api('/drive?d=0&v=0'); api('/steer?d=0'); } });
+        api('/ping'); sendSteerSpeed();
+    </script>
+</body>
+</html>
+)rawliteral";
+
+void sendText(const String& s) {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", s);
+}
+
+void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleDrive() {
+  int d = server.arg("d").toInt();
+  int v = server.arg("v").toInt();
+  lastCmd = millis();
+  setMotor(d, v);
+  sendText("ok");
+}
+
+void handleSteer() {
+  int d = server.arg("d").toInt();
+  if (d == 0) {
+    goHome();
+  } else {
+    int newDir = (d > 0) ? 1 : -1;
+    if (steerDir != newDir) lastSteerStep = millis();
+    steerDir = newDir;
+    lastSteerCmd = millis();
+  }
+  sendText("ok");
+}
+
+void handleSteerSpeed() {
+  int v = constrain(server.arg("v").toInt(), 1, 100);
+  steerRate = v * STEER_RATE_PER_PERCENT;
+  sendText("ok");
+}
+
+void handleHomeOpen() {
+  servoWrite(homeAngle);
+  sendText(String(homeAngle));
+}
+
+void handleHomeStep() {
+  homeAngle = constrain(homeAngle + server.arg("d").toInt(), 0, 180);
+  servoWrite(homeAngle);
+  sendText(String(homeAngle));
+}
+
+void handleHomeSave() {
+  savedHome = homeAngle;
+  prefs.putInt("home", savedHome);
+  servoWrite(homeAngle);
+  sendText("saved");
+}
+
+void handleHomeCancel() {
+  homeAngle = savedHome;
+  servoWrite(homeAngle);
+  sendText(String(homeAngle));
+}
+
+void handleOther() {
+  sendText("ok");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  ledcAttach(MOTOR_FWD_PIN, 1000, 8);
+  ledcAttach(MOTOR_BWD_PIN, 1000, 8);
+  ledcAttach(SERVO_PIN, 50, 16);
+  setMotor(0, 0);
+
+  prefs.begin("spherebot", false);
+  savedHome = prefs.getInt("home", DEFAULT_HOME);
+  homeAngle = savedHome;
+  servoWrite(homeAngle);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  
+  server.on("/", handleRoot);
+  server.on("/drive", handleDrive);
+  server.on("/steer", handleSteer);
+  server.on("/steerspeed", handleSteerSpeed);
+  server.on("/homeopen", handleHomeOpen);
+  server.on("/homestep", handleHomeStep);
+  server.on("/homesave", handleHomeSave);
+  server.on("/homecancel", handleHomeCancel);
+  server.onNotFound(handleOther);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  if (steerDir != 0 && now - lastSteerStep >= 10) {
+    float dt = (now - lastSteerStep) / 1000.0f;
+    lastSteerStep = now;
+    steerOffset += steerDir * steerRate * dt;
+    steerOffset = constrain(steerOffset, (float)-STEER_MAX, (float)STEER_MAX);
+    servoWrite(homeAngle + (int)roundf(steerOffset));
+  }
+
+  if (motorDir != 0 && now - lastCmd > WATCHDOG_MS) {
+    setMotor(0, 0);
+  }
+
+  if (steerDir != 0 && now - lastSteerCmd > WATCHDOG_MS) {
+    goHome();
+  }
+}
