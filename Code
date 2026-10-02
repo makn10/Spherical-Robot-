@@ -2,8 +2,8 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
-const char* AP_SSID = "DUET_Helix_TF";
-const char* AP_PASS = "21345678";
+const char* AP_SSID = "DUET_Omicron";
+const char* AP_PASS = "";
 
 const int MOTOR_FWD_PIN = 22;
 const int MOTOR_BWD_PIN = 23;
